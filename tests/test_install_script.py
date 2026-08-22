@@ -19,7 +19,27 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn('GSR_FFMPEG6_REF="5.12.5"', script)
         self.assertIn('VICE_GSR_REF:-', script)
         self.assertIn("major < 59", script)
-        self.assertIn('git clone --depth 1 --branch "$gsr_ref" "$GSR_REPO_URL" "$tmpdir"', script)
+        self.assertIn('_gsr_fetch_source "$gsr_ref" "$tmpdir"', script)
+        self.assertIn('git clone --depth 1 --branch "$ref" "$GSR_REPO_URL" "$dest"', script)
+
+    def test_gsr_source_falls_back_to_the_upstream_tarball(self) -> None:
+        """#182: repo.dec05eba.com redirected a reporter to the cgit browse
+        host, which serves no git protocol, and the install had nowhere else to
+        go. The tarball is the same source upstream's own AUR package builds."""
+        script = self.script
+
+        self.assertIn("VICE_GSR_SNAPSHOT_URL:-", script)
+        self.assertIn("https://dec05eba.com/snapshot", script)
+        self.assertIn('tarball="$GSR_SNAPSHOT_URL/gpu-screen-recorder.git.$ref.tar.gz"', script)
+        # Both download tools, so a machine with only one of them still works.
+        self.assertIn('curl -fsSL "$tarball" | tar -xz -C "$dest"', script)
+        self.assertIn('wget -qO- "$tarball" | tar -xz -C "$dest"', script)
+        # A dead end names what it tried and how to point elsewhere.
+        self.assertIn("Could not fetch gpu-screen-recorder $ref.", script)
+        self.assertIn("VICE_GSR_REPO_URL, VICE_GSR_SNAPSHOT_URL or VICE_GSR_REF.", script)
+        # The fetch has to be defined before the build function that calls it.
+        self.assertLess(script.index("_gsr_fetch_source() {"),
+                        script.index("_gsr_build_from_source() {"))
 
     def test_rpm_ostree_guard_runs_before_package_manager_detection(self) -> None:
         script = self.script

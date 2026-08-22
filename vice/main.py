@@ -1010,10 +1010,12 @@ class ViceDaemon:
         """
         game = None
         win = None
+        adapter = "none"
         scanned = False
         candidates = 0
         try:
-            from .active_window import get_active_window
+            from .active_window import adapter_name, get_active_window
+            adapter = adapter_name()
             win = get_active_window()
             game = self._match_game(win) if win else None
             if game is None:
@@ -1031,12 +1033,13 @@ class ViceDaemon:
             log.debug("Game detection for clip tagging failed", exc_info=True)
         # One line per clip so an unmatched game or a compositor miss is
         # diagnosable from vice.log. A focused window with no match means the
-        # game is not on the curated list; no window and no candidates means
-        # the compositor told us nothing, which is a different problem (#176).
-        # Local only, never leaves the machine.
+        # game is not on the curated list; adapter=none means the session never
+        # gave Vice a way to look, which is a different problem (#176). Local
+        # only, never leaves the machine, and no window title goes in it.
         log.info(
-            "Clip game detection: process=%r class=%r matched=%r scanned=%s candidates=%d",
-            (win or {}).get("process"), (win or {}).get("class"), game, scanned, candidates,
+            "Clip game detection: adapter=%s process=%r class=%r matched=%r scanned=%s candidates=%d",
+            adapter, (win or {}).get("process"), (win or {}).get("class"),
+            game, scanned, candidates,
         )
         self._last_clip_game = game
         if not getattr(self.cfg.output, "tag_clips_with_game", False):
@@ -1863,6 +1866,13 @@ def doctor() -> None:
     for tool in ("gpu-screen-recorder", "wf-recorder", "ffmpeg", "xdg-open", "systemctl",
                  "xdotool", "xprop", "wmctrl"):
         click.echo(f"  {tool}: {shutil.which(tool) or '(not found)'}")
+    click.echo("")
+
+    # From this shell, which is not necessarily what the daemon's environment
+    # looks like. When this says x11 and the log line below says adapter=none,
+    # the daemon started before the session exported DISPLAY (#176).
+    from .active_window import adapter_name
+    click.echo(f"Window detection (this shell): {adapter_name()}")
     click.echo("")
 
     click.echo("Recent daemon log")

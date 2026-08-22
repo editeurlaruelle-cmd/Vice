@@ -404,6 +404,12 @@ install_pkgs_zypper() {
 # fire when the user explicitly sets recording.backend in config, they're
 # edge-case overrides, never defaults. install.sh aborts if GSR can't be installed.
 GSR_REPO_URL="${VICE_GSR_REPO_URL:-https://repo.dec05eba.com/gpu-screen-recorder}"
+# Upstream's own AUR package builds from these per-tag tarballs rather than from
+# git. They are a second host for the same code, which the clone alone is not:
+# repo.dec05eba.com answered one reporter with a redirect to the cgit browse
+# host, which serves no git protocol at all, and the install had nowhere to go
+# from there (#182).
+GSR_SNAPSHOT_URL="${VICE_GSR_SNAPSHOT_URL:-https://dec05eba.com/snapshot}"
 GSR_DEFAULT_REF="5.13.3"
 GSR_FFMPEG6_REF="5.12.5"
 
@@ -468,6 +474,37 @@ _dnf_install_best_effort() {
     fi
 }
 
+# Fetch the gpu-screen-recorder source into an empty directory. Tries git
+# first, then the tarball, so one host being down or misrouted is no longer the
+# end of the install.
+_gsr_fetch_source() {
+    local ref="$1" dest="$2"
+    local tarball="$GSR_SNAPSHOT_URL/gpu-screen-recorder.git.$ref.tar.gz"
+
+    if command -v git &>/dev/null; then
+        git clone --depth 1 --branch "$ref" "$GSR_REPO_URL" "$dest" && return 0
+        warn "Could not clone $GSR_REPO_URL, trying the source tarball instead."
+    else
+        warn "git is not installed; using the source tarball."
+    fi
+
+    # The archive has no top-level directory, so it lands straight in $dest.
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$tarball" | tar -xz -C "$dest" && return 0
+    elif command -v wget &>/dev/null; then
+        wget -qO- "$tarball" | tar -xz -C "$dest" && return 0
+    else
+        error "Neither curl nor wget is installed, so the tarball fallback cannot run."
+    fi
+
+    error "Could not fetch gpu-screen-recorder $ref."
+    error "  git:     $GSR_REPO_URL"
+    error "  tarball: $tarball"
+    error "Check that both are reachable, or point Vice elsewhere with"
+    error "VICE_GSR_REPO_URL, VICE_GSR_SNAPSHOT_URL or VICE_GSR_REF."
+    return 1
+}
+
 _gsr_build_from_source() {
     info "Building gpu-screen-recorder from source (this takes 2-5 minutes)..."
     case "$PKG" in
@@ -510,7 +547,7 @@ _gsr_build_from_source() {
         info "Using gpu-screen-recorder source ref: $gsr_ref"
     fi
     tmpdir=$(mktemp -d -t vice-gsr-XXXXXX)
-    git clone --depth 1 --branch "$gsr_ref" "$GSR_REPO_URL" "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
+    _gsr_fetch_source "$gsr_ref" "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
     # Build as the invoking user; only the install step needs root. Running
     # upstream's deprecated install.sh under sudo built everything as root,
     # which left a root-owned build tree in /tmp that the cleanup below

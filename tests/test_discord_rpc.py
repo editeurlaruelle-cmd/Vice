@@ -594,6 +594,35 @@ class CompositorAdapterTests(unittest.TestCase):
         adapter = self._detect({"SWAYSOCK": "/run/sway.sock"})
         self.assertIs(adapter, active_window._get_active_window_sway)
 
+    def test_a_display_arriving_late_is_picked_up(self):
+        """#176: the daemon can reach this module before the session has
+        exported DISPLAY, and deciding once at import left KDE and GNOME
+        Wayland with no detection at all until it was restarted by hand."""
+        from vice import active_window as aw
+
+        bare = {"XDG_RUNTIME_DIR": "/run/user/1000"}
+        with mock.patch.object(aw, "_ADAPTER", None), \
+             mock.patch.dict(os.environ, bare, clear=True):
+            self.assertFalse(aw.supported_compositor())
+            self.assertEqual(aw.adapter_name(), "none")
+            self.assertEqual(aw.list_candidate_windows(), [])
+
+            os.environ["DISPLAY"] = ":0"
+            self.assertTrue(aw.uses_x11_adapter())
+            self.assertEqual(aw.adapter_name(), "x11")
+
+    def test_a_resolved_adapter_is_not_re_derived(self):
+        from vice import active_window as aw
+
+        with mock.patch.object(aw, "_ADAPTER", None), \
+             mock.patch.dict(os.environ, {"SWAYSOCK": "/run/sway.sock"}, clear=True):
+            self.assertEqual(aw.adapter_name(), "sway")
+            # The session cannot change under a running daemon, and re-deriving
+            # on every call would make a transient empty environment lose it.
+            with mock.patch.object(aw, "_detect_compositor_adapter",
+                                   side_effect=AssertionError("re-derived")):
+                self.assertEqual(aw.adapter_name(), "sway")
+
     def test_pure_x11_selected(self):
         from vice import active_window
         adapter = self._detect({"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"})
@@ -643,7 +672,7 @@ class CandidateWindowScanTests(unittest.TestCase):
     def test_candidate_windows_empty_on_non_x11_adapters(self) -> None:
         from vice import active_window as aw
 
-        with mock.patch.object(aw, "_ADAPTER", aw._get_active_window_hyprland):
+        with mock.patch.object(aw, "_current_adapter", lambda: aw._get_active_window_hyprland):
             self.assertEqual(aw.list_candidate_windows(), [])
 
 
@@ -733,7 +762,7 @@ class PointerDisplayTests(unittest.TestCase):
     def test_unsupported_session_reports_no_pointer_display(self) -> None:
         from vice import active_window as aw
 
-        with mock.patch.object(aw, "_ADAPTER", None):
+        with mock.patch.object(aw, "_current_adapter", lambda: None):
             self.assertFalse(aw.pointer_display_supported())
             self.assertIsNone(aw.pointer_display())
 
@@ -742,6 +771,6 @@ class PointerDisplayTests(unittest.TestCase):
         # Wayland must not claim support just because XWayland is up.
         from vice import active_window as aw
 
-        with mock.patch.object(aw, "_ADAPTER", aw._get_active_window_x11), \
+        with mock.patch.object(aw, "_current_adapter", lambda: aw._get_active_window_x11), \
              mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}):
             self.assertFalse(aw.pointer_display_supported())

@@ -207,7 +207,7 @@ def list_candidate_windows() -> list[ActiveWindow]:
     compositors where the focused window can't be read reliably (KWin only
     partially mirrors focus into XWayland's EWMH properties, #102). Empty on
     non-X11 adapters, Hyprland and Sway report focus natively."""
-    if _ADAPTER is not _get_active_window_x11:
+    if _current_adapter() is not _get_active_window_x11:
         return []
     try:
         windows = _candidate_windows_wmctrl()
@@ -333,11 +333,12 @@ def _pointer_display_x11() -> Optional[str]:
 def pointer_display() -> Optional[str]:
     """Name of the monitor the pointer is on, or None when it cannot be
     determined (unsupported compositor, missing tools)."""
-    if _ADAPTER is _get_active_window_hyprland:
+    adapter = _current_adapter()
+    if adapter is _get_active_window_hyprland:
         resolver = _pointer_display_hyprland
-    elif _ADAPTER is _get_active_window_sway:
+    elif adapter is _get_active_window_sway:
         resolver = _pointer_display_sway
-    elif _ADAPTER is _get_active_window_x11 and not os.environ.get("WAYLAND_DISPLAY"):
+    elif adapter is _get_active_window_x11 and not os.environ.get("WAYLAND_DISPLAY"):
         # Under XWayland the X pointer only tracks the real one while it is
         # over an X surface, so this is X11 sessions only.
         resolver = _pointer_display_x11
@@ -353,9 +354,10 @@ def pointer_display() -> Optional[str]:
 def pointer_display_supported() -> bool:
     """For the settings UI. Whether follow-the-pointer capture can work on the
     running session."""
-    if _ADAPTER in (_get_active_window_hyprland, _get_active_window_sway):
+    adapter = _current_adapter()
+    if adapter in (_get_active_window_hyprland, _get_active_window_sway):
         return True
-    return _ADAPTER is _get_active_window_x11 and not os.environ.get("WAYLAND_DISPLAY")
+    return adapter is _get_active_window_x11 and not os.environ.get("WAYLAND_DISPLAY")
 
 
 def detection_tools_status() -> dict:
@@ -382,16 +384,33 @@ def _detect_compositor_adapter() -> Optional[Callable[[], Optional[ActiveWindow]
     return None
 
 
-_ADAPTER: Optional[Callable[[], Optional[ActiveWindow]]] = _detect_compositor_adapter()
+# Resolved on first use and kept once found. Deliberately not resolved at import
+# time: the daemon can reach this module before the session has exported
+# DISPLAY, because the unit is wanted by default.target as well as
+# graphical-session.target (#139) and wait_for_display() is satisfied by
+# WAYLAND_DISPLAY on its own. Deciding once, that early, left KDE and GNOME
+# Wayland sessions with no window detection at all for the life of the process,
+# which is why restarting the daemon by hand appeared to fix game tagging
+# (#176). A failed detection is never cached, so a display arriving late is
+# picked up on the next call.
+_ADAPTER: Optional[Callable[[], Optional[ActiveWindow]]] = None
+
+
+def _current_adapter() -> Optional[Callable[[], Optional[ActiveWindow]]]:
+    global _ADAPTER
+    if _ADAPTER is None:
+        _ADAPTER = _detect_compositor_adapter()
+    return _ADAPTER
 
 
 def get_active_window() -> Optional[ActiveWindow]:
     """Return the currently focused window, or None on unsupported compositors
     or when no focused window can be determined."""
-    if _ADAPTER is None:
+    adapter = _current_adapter()
+    if adapter is None:
         return None
     try:
-        return _ADAPTER()
+        return adapter()
     except Exception as exc:
         log.debug("active_window adapter raised: %s", exc)
         return None
@@ -399,9 +418,18 @@ def get_active_window() -> Optional[ActiveWindow]:
 
 def supported_compositor() -> bool:
     """For UI display, whether v1 supports the running compositor."""
-    return _ADAPTER is not None
+    return _current_adapter() is not None
 
 
 def uses_x11_adapter() -> bool:
     """Whether detection goes through xdotool/xprop (X11 or XWayland)."""
-    return _ADAPTER is _get_active_window_x11
+    return _current_adapter() is _get_active_window_x11
+
+
+def adapter_name() -> str:
+    """Which adapter detection is using, for logs and doctor."""
+    return {
+        _get_active_window_hyprland: "hyprland",
+        _get_active_window_sway:     "sway",
+        _get_active_window_x11:      "x11",
+    }.get(_current_adapter(), "none")

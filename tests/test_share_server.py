@@ -808,7 +808,7 @@ class TrimKeyframeTests(unittest.IsolatedAsyncioTestCase):
         return src
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
-    async def test_a_copy_between_keyframes_is_detected(self) -> None:
+    async def test_a_copy_between_keyframes_is_rejected(self) -> None:
         import vice.share as share_mod
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -819,15 +819,80 @@ class TrimKeyframeTests(unittest.IsolatedAsyncioTestCase):
                  "-ss", "2.0", "-i", str(src), "-t", "1.0",
                  "-c", "copy", "-y", str(cut)], check=True,
             )
-            self.assertEqual(self._keyframe_count(cut), 0, "fixture is not the broken case")
-            self.assertFalse(await share_mod._starts_on_a_keyframe(cut))
+            # Assert the probe answered before trusting its verdict: an
+            # unanswerable probe is "" too, and a bare assertNotEqual on that
+            # fails with nothing to read.
+            self.assertIsNotNone(await share_mod._first_video_packet(cut),
+                                 "the packet probe has to answer at all")
+            problem = await share_mod._trim_result_problem(cut)
+            self.assertNotEqual(problem, "", f"{cut.name} should have been rejected")
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
     async def test_a_clean_copy_is_left_alone(self) -> None:
         import vice.share as share_mod
         with tempfile.TemporaryDirectory() as tmp:
             src = self._long_gop_source(Path(tmp))
-            self.assertTrue(await share_mod._starts_on_a_keyframe(src))
+            problem = await share_mod._trim_result_problem(src)
+            self.assertEqual(problem, "", f"an untouched recording is not a problem: {problem}")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+    async def test_a_healthy_copy_on_an_edit_list_is_rejected(self) -> None:
+        """The check this replaced asked ffprobe for the frame at timestamp
+        zero. A stream copy expresses its in-point with a leading edit list and
+        timestamps below zero, so ffprobe answered with nothing and every trim
+        re-encoded, which is how H.265 clips came back as H.264."""
+        import vice.share as share_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = self._long_gop_source(root)
+            cut = root / "cut.mp4"
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-ss", "2.0", "-i", str(src), "-t", "1.0",
+                 "-c", "copy", "-y", str(cut)], check=True,
+            )
+            packet = await share_mod._first_video_packet(cut)
+            self.assertIsNotNone(packet, "the packet probe has to answer at all")
+            pts, flags = packet
+            if pts < 0:
+                self.assertIn("K", flags, "ffmpeg kept the leading keyframe")
+                self.assertEqual(
+                    await share_mod._trim_result_problem(cut),
+                    "starts on an edit list before zero",
+                )
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+    async def test_an_unplayable_result_leaves_the_original_alone(self) -> None:
+        """A trim Vice cannot decode must not reach the user's clip. Silently
+        replacing it is what left people with a black frame and no reason."""
+        import vice.share as share_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = self._long_gop_source(root)
+            before = src.read_bytes()
+            cfg = Config()
+            cfg.output.directory = str(root)
+            server = ShareServer(cfg)
+            server._clips["Vice_Clip_1"] = src
+
+            req = mock.MagicMock()
+            req.match_info = {"slug": "Vice_Clip_1"}
+            req.json = mock.AsyncMock(return_value={"start": 2.0, "end": 4.0})
+            with mock.patch.object(share_mod, "_purge_slug_thumbs"), \
+                 mock.patch.object(share_mod, "_purge_slug_proxies"), \
+                 mock.patch.object(share_mod, "_trim_result_problem",
+                                   new=mock.AsyncMock(return_value="starts between keyframes")), \
+                 mock.patch.object(share_mod, "_trim_encoder_candidates",
+                                   return_value=["libx264"]), \
+                 mock.patch.object(server, "_broadcast_clip", new=mock.AsyncMock()):
+                resp = await server._api_trim(req)
+
+            body = json.loads(resp.text)
+            self.assertFalse(body["ok"])
+            self.assertIn("starts between keyframes", body["error"])
+            self.assertEqual(src.read_bytes(), before)
+            self.assertFalse(list(root.glob("*.trimming.*")))
+
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
     async def test_trim_between_keyframes_still_yields_a_playable_exact_cut(self) -> None:
@@ -853,6 +918,115 @@ class TrimKeyframeTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(self._duration(src), 2.0, delta=0.2)
             self.assertGreaterEqual(self._keyframe_count(src), 1)
 
+
+
+@unittest.skipUnless(ShareServer is not None, "aiohttp is not installed")
+class TrimEncoderTests(unittest.IsolatedAsyncioTestCase):
+    """#172: a trim that has to re-encode used to hardcode libx264, so every
+    H.265 recording came back as H.264 whatever the user set Video codec to."""
+
+    def setUp(self) -> None:
+        import vice.share as share_mod
+        share_mod._trim_encoder_cache.clear()
+        self.addCleanup(share_mod._trim_encoder_cache.clear)
+
+    def _candidates(self, vcodec: str, installed: set, nvidia: bool) -> list:
+        import vice.share as share_mod
+        with mock.patch.object(share_mod, "_available_encoders", return_value=installed), \
+             mock.patch.object(share_mod, "_is_nvidia", return_value=nvidia):
+            return share_mod._trim_encoder_candidates(vcodec)
+
+    ALL = {"hevc_nvenc", "hevc_vaapi", "libx265", "libx264",
+           "av1_nvenc", "av1_vaapi", "libsvtav1", "h264_nvenc", "h264_vaapi"}
+
+    def test_the_clips_own_codec_comes_first(self) -> None:
+        self.assertEqual(
+            self._candidates("hevc", self.ALL, nvidia=True),
+            ["hevc_nvenc", "hevc_vaapi", "libx265", "libx264"],
+        )
+
+    def test_av1_and_unknown_codecs_have_their_own_rows(self) -> None:
+        self.assertEqual(
+            self._candidates("av1", self.ALL, nvidia=True),
+            ["av1_nvenc", "av1_vaapi", "libsvtav1", "libx264"],
+        )
+        self.assertEqual(
+            self._candidates("", self.ALL, nvidia=True),
+            ["h264_nvenc", "h264_vaapi", "libx264"],
+        )
+
+    def test_nvenc_is_dropped_without_an_nvidia_card(self) -> None:
+        self.assertEqual(
+            self._candidates("hevc", self.ALL, nvidia=False),
+            ["hevc_vaapi", "libx265", "libx264"],
+        )
+
+    def test_software_only_ffmpeg_behaves_the_way_it_always_has(self) -> None:
+        self.assertEqual(self._candidates("hevc", {"libx264"}, nvidia=True), ["libx264"])
+
+    def test_an_unanswerable_probe_still_offers_the_whole_row(self) -> None:
+        # ffmpeg -encoders failing is no opinion, not "nothing is available".
+        self.assertEqual(
+            self._candidates("hevc", set(), nvidia=True),
+            ["hevc_nvenc", "hevc_vaapi", "libx265", "libx264"],
+        )
+
+    def test_the_encoder_that_worked_is_tried_first_next_time(self) -> None:
+        import vice.share as share_mod
+        self._candidates("hevc", self.ALL, nvidia=True)
+        share_mod._remember_trim_encoder("hevc", "libx265")
+        self.assertEqual(
+            share_mod._trim_encoder_candidates("hevc"),
+            ["libx265", "hevc_nvenc", "hevc_vaapi", "libx264"],
+        )
+
+    def test_each_encoder_gets_the_arguments_its_scale_needs(self) -> None:
+        import vice.share as share_mod
+        pre, out = share_mod._trim_encoder_args("hevc_vaapi")
+        self.assertEqual(pre, ["-vaapi_device", "/dev/dri/renderD128"])
+        self.assertIn("format=nv12,hwupload", out)
+        self.assertEqual(share_mod._trim_encoder_args("hevc_nvenc")[1][:2], ["-c:v", "hevc_nvenc"])
+        # Audio survives whichever encoder wins.
+        for encoder in ("hevc_nvenc", "hevc_vaapi", "libx265", "libx264", "libsvtav1"):
+            self.assertIn("-c:a", share_mod._trim_encoder_args(encoder)[1])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+    async def test_a_trim_keeps_the_clips_codec(self) -> None:
+        import vice.share as share_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "Vice_Clip_1.mp4"
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=6",
+                 "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=none",
+                 "-g", "300", "-keyint_min", "300", "-tag:v", "hev1",
+                 "-pix_fmt", "yuv420p", "-y", str(src)], check=True,
+            )
+            cfg = Config()
+            cfg.output.directory = str(root)
+            server = ShareServer(cfg)
+            server._clips["Vice_Clip_1"] = src
+
+            req = mock.MagicMock()
+            req.match_info = {"slug": "Vice_Clip_1"}
+            req.json = mock.AsyncMock(return_value={"start": 2.0, "end": 4.0})
+            # Software only, so the assertion does not depend on the machine.
+            with mock.patch.object(share_mod, "_purge_slug_thumbs"), \
+                 mock.patch.object(share_mod, "_purge_slug_proxies"), \
+                 mock.patch.object(share_mod, "_available_encoders",
+                                   return_value={"libx265", "libx264"}), \
+                 mock.patch.object(share_mod, "_is_nvidia", return_value=False), \
+                 mock.patch.object(server, "_broadcast_clip", new=mock.AsyncMock()):
+                resp = await server._api_trim(req)
+
+            self.assertTrue(json.loads(resp.text)["ok"], resp.text)
+            codec = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(src)],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(codec, "hevc")
 
 @unittest.skipUnless(ShareServer is not None, "aiohttp is not installed")
 class AutoPlaylistToggleTests(unittest.IsolatedAsyncioTestCase):

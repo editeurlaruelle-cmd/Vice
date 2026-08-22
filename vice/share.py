@@ -46,9 +46,10 @@ from .editor import (EditorProjectStore, ExportBusy, ExportManager, Source,
 from .media import probe_media, probe_media_detailed
 from .playlists import (IMAGE_PREFIX, PlaylistStore, build_tag_index,
                         image_slug)
-from .recorder import (IMAGE_EXTS, KEEP_ALL_STREAMS, filename_tag,
-                       list_display_options, list_gsr_audio_sources,
-                       next_image_path, slugify_clip_name)
+from .recorder import (IMAGE_EXTS, KEEP_ALL_STREAMS, _available_encoders,
+                       _is_nvidia, filename_tag, list_display_options,
+                       list_gsr_audio_sources, next_image_path,
+                       slugify_clip_name)
 from .runtime import actual_home_dir, resolve_path
 
 log = logging.getLogger("vice.share")
@@ -305,18 +306,83 @@ async def copy_image_to_clipboard(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-async def _starts_on_a_keyframe(path: Path) -> bool:
-    """True when the first video frame of *path* can start a decode.
+# Encoders to try when a trim has to re-encode, best first, per source codec.
+# Software is last on every row, so a machine with no usable hardware encoder
+# behaves exactly the way it always has.
+_TRIM_ENCODERS = {
+    "hevc": ("hevc_nvenc", "hevc_vaapi", "libx265", "libx264"),
+    "h265": ("hevc_nvenc", "hevc_vaapi", "libx265", "libx264"),
+    "av1":  ("av1_nvenc", "av1_vaapi", "libsvtav1", "libx264"),
+}
+_TRIM_ENCODERS_DEFAULT = ("h264_nvenc", "h264_vaapi", "libx264")
+_VAAPI_RENDER_NODE = "/dev/dri/renderD128"
 
-    A stream copy that begins between keyframes produces a track whose every
-    frame refers back to a picture the file does not contain. It probes fine
-    and tolerant players show it, so the file looks healthy everywhere except
-    the app window, which stays black with no error (#172).
+_trim_encoder_cache: dict[str, list[str]] = {}
+
+
+def _trim_encoder_candidates(vcodec: str) -> list[str]:
+    """Encoders worth trying for a trim of a *vcodec* clip, best first.
+
+    Keeping the clip's own codec matters. Trimming used to rewrite every H.265
+    recording as H.264, against the user's own Video codec setting and the file
+    size they picked it for (#172). Probing is cached per codec because it
+    shells out to ffmpeg and nvidia-smi.
+    """
+    key = (vcodec or "").lower()
+    if key not in _trim_encoder_cache:
+        names = _TRIM_ENCODERS.get(key, _TRIM_ENCODERS_DEFAULT)
+        installed = _available_encoders()
+        # An empty probe is no opinion, so try the whole list rather than none.
+        picked = [n for n in names if n in installed] if installed else list(names)
+        if not _is_nvidia():
+            picked = [n for n in picked if not n.endswith("_nvenc")]
+        _trim_encoder_cache[key] = picked or ["libx264"]
+    return _trim_encoder_cache[key]
+
+
+def _remember_trim_encoder(vcodec: str, encoder: str) -> None:
+    """Move the encoder that worked to the front, so the next trim of the same
+    codec does not open a device that already refused once. ffmpeg being built
+    with an encoder says nothing about the driver accepting it."""
+    picked = _trim_encoder_cache.get((vcodec or "").lower())
+    if picked and encoder in picked:
+        picked.remove(encoder)
+        picked.insert(0, encoder)
+
+
+def _trim_encoder_args(encoder: str) -> tuple[list[str], list[str]]:
+    """(arguments before -i, arguments after) for one trim encoder.
+
+    Quality is per encoder because the scales are not comparable: x265 at 23
+    and NVENC at 22 land near x264 at 20, which is what trimming has always
+    used. Audio is copied whichever encoder wins, so every recorded track
+    survives at its original quality.
+    """
+    if encoder.endswith("_nvenc"):
+        return [], ["-c:v", encoder, "-rc", "vbr", "-cq", "22", "-preset", "p4",
+                    "-c:a", "copy"]
+    if encoder.endswith("_vaapi"):
+        return (["-vaapi_device", _VAAPI_RENDER_NODE],
+                ["-vf", "format=nv12,hwupload", "-c:v", encoder, "-qp", "22",
+                 "-c:a", "copy"])
+    if encoder == "libsvtav1":
+        return [], ["-c:v", encoder, "-crf", "30", "-preset", "8", "-c:a", "copy"]
+    crf = "23" if encoder == "libx265" else "20"
+    return [], ["-c:v", encoder, "-preset", "veryfast", "-crf", crf, "-c:a", "copy"]
+
+
+async def _first_video_packet(path: Path) -> Optional[tuple[float, str]]:
+    """(timestamp, flags) of the first video packet, or None when ffprobe
+    cannot say.
+
+    Deliberately unanchored. Asking for the packet at timestamp zero misses it
+    entirely on a stream copy, because ffmpeg expresses "start here" with a
+    leading edit list and timestamps that begin below zero, and ffprobe then
+    answers with nothing at all (#172).
     """
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-read_intervals", "%+#1",
-        "-show_entries", "frame=key_frame", "-of", "csv=p=0", str(path),
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(path),
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -324,17 +390,72 @@ async def _starts_on_a_keyframe(path: Path) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
     except (asyncio.TimeoutError, OSError) as exc:
-        log.debug("Keyframe probe of %s failed: %s", path.name, exc)
-        # No opinion means keep what we have rather than re-encoding blindly.
-        return True
+        log.debug("Packet probe of %s failed: %s", path.name, exc)
+        return None
     if proc.returncode != 0:
-        return True
-    first = (out or b"").decode(errors="replace").strip().split(",")[0]
-    # An empty answer is the loudest one: ffprobe could not decode a single
-    # frame, which is the case this exists to catch.
-    return first == "1"
+        return None
+    first = (out or b"").decode(errors="replace").strip().split("\n")[0]
+    pts, _, flags = first.partition(",")
+    try:
+        return float(pts), flags
+    except ValueError:
+        return None
+
+
+async def _decode_complaint(path: Path) -> Optional[str]:
+    """What a decoder says when asked for a picture from the start of *path*,
+    or None when it produces one without complaining. ffmpeg reports a missing
+    reference picture on stderr and still exits zero, so the output is the
+    answer, not the exit code."""
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path),
+        "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except (asyncio.TimeoutError, OSError) as exc:
+        log.debug("Decode probe of %s failed: %s", path.name, exc)
+        return None
+    complaint = (stderr or b"").decode(errors="replace").strip()
+    if proc.returncode == 0 and not complaint:
+        return None
+    return complaint.splitlines()[0] if complaint else "ffmpeg could not read it"
+
+
+async def _trim_result_problem(path: Path) -> str:
+    """Why the trimmed *path* would not play in the app window, or "" when it
+    will.
+
+    A trimmed clip has to start the way an untrimmed one does, and two shapes
+    get past every other check. A stream copy that begins between keyframes
+    leaves a track whose frames refer back to a picture the file does not
+    contain. A copy that begins on a leading edit list only plays where the
+    player honours edit lists. Both probe fine, both play in mpv and VLC, and
+    both are a black frame with the duration filled in and no error at all in
+    the app window (#172).
+
+    An unanswerable probe returns "", because keeping the copy is better than
+    re-encoding on a guess.
+    """
+    packet = await _first_video_packet(path)
+    if packet is None:
+        return ""
+    pts, flags = packet
+    if "K" not in flags:
+        return "starts between keyframes"
+    if pts < 0:
+        return "starts on an edit list before zero"
+    complaint = await _decode_complaint(path)
+    if complaint:
+        return f"cannot decode its first frame ({complaint})"
+    return ""
 
 
 async def _make_preview_proxy(path: Path, vcodec: str) -> Optional[Path]:
@@ -1191,21 +1312,19 @@ class ShareServer:
         ext = path.suffix.lstrip(".") or "mp4"
         tmp = path.with_suffix(f".trimming.{ext}")
         faststart = ["-movflags", "+faststart"] if ext == "mp4" else []
+        source_codec = (await self._get_meta(slug, path)).get("vcodec", "")
 
-        def _trim_cmd(reencode: bool) -> list[str]:
-            # Audio is copied either way, so every recorded track survives at
-            # its original quality.
-            codec = (
-                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "copy"]
-                if reencode
-                else ["-c", "copy"]
-            )
+        def _trim_cmd(encoder: Optional[str]) -> list[str]:
+            """Stream copy when *encoder* is None, otherwise re-encode the video
+            with it. Audio is copied either way, so every recorded track
+            survives at its original quality."""
+            pre, out = ([], ["-c", "copy"]) if encoder is None else _trim_encoder_args(encoder)
             return [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "ffmpeg", "-hide_banner", "-loglevel", "error", *pre,
                 "-ss", str(start), "-i", str(path),
                 "-t",  str(end - start),
                 *KEEP_ALL_STREAMS,
-                *codec,
+                *out,
                 *faststart,
                 "-y",  str(tmp),
             ]
@@ -1222,24 +1341,44 @@ class ShareServer:
             except asyncio.TimeoutError:
                 return False, "ffmpeg timed out"
 
-        # Copy first: it is instant and lossless, and most cuts land on a
-        # keyframe. When this one does not, the copy cannot produce a decodable
-        # track, and re-encoding is the only way to give the exact frame the
-        # user asked for. Seeking to the previous keyframe instead would play,
-        # but it would silently hand back a clip that starts before the chosen
-        # in-point (#172).
-        ok, err = await _run(_trim_cmd(reencode=False), 120)
-        if ok and not await _starts_on_a_keyframe(tmp):
-            log.info("Trim of %s landed between keyframes, re-encoding", path.name)
-            ok, err = await _run(_trim_cmd(reencode=True), 600)
-        elif not ok:
-            log.warning("Copy trim of %s failed, retrying with a re-encode: %s",
-                        path.name, err)
-            ok, err = await _run(_trim_cmd(reencode=True), 600)
+        # Copy first: it is instant and lossless, and a cut that lands on a
+        # keyframe needs nothing else. When the copy would not play, re-encode
+        # into the clip's own codec, which is the only way to give the exact
+        # frame the user asked for. Seeking to the previous keyframe instead
+        # would play, but it would silently hand back a clip that starts before
+        # the chosen in-point (#172).
+        ok, err = await _run(_trim_cmd(None), 120)
+        if ok:
+            problem = await _trim_result_problem(tmp)
+            if problem:
+                log.info("Copy trim of %s %s, re-encoding", path.name, problem)
+        else:
+            problem = "could not be stream copied"
+            log.warning("Copy trim of %s failed, re-encoding: %s", path.name, err)
 
-        if not ok or not tmp.exists():
+        if problem:
+            candidates = await asyncio.to_thread(_trim_encoder_candidates, source_codec)
+            for encoder in candidates:
+                ok, err = await _run(_trim_cmd(encoder), 900)
+                if not ok:
+                    log.info("Trim of %s with %s failed: %s", path.name, encoder, err)
+                    continue
+                problem = await _trim_result_problem(tmp)
+                if problem:
+                    err = f"the trimmed clip {problem}"
+                    log.warning("Trim of %s with %s %s", path.name, encoder, problem)
+                    continue
+                _remember_trim_encoder(source_codec, encoder)
+                log.info("Trimmed %s with %s", path.name, encoder)
+                break
+
+        # Never replace the user's recording with a file Vice has not decoded.
+        # Failing here leaves the original on disk and says why, which beats
+        # handing back a clip that opens black and explains nothing (#172).
+        if problem or not ok or not tmp.exists():
             tmp.unlink(missing_ok=True)
-            return web.json_response({"ok": False, "error": err or "trim failed"})
+            return web.json_response(
+                {"ok": False, "error": err or problem or "trim failed"})
 
         tmp.replace(path)
         # Clear cached thumbnail and metadata so they regenerate on next access
