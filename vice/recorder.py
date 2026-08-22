@@ -279,8 +279,11 @@ def _normalize_gsr_codec_name(name: str) -> str:
     return name
 
 
-@lru_cache(maxsize=None)
 def _gsr_supported_codecs_normalized() -> frozenset[str]:
+    """_gsr_supported_codecs(), with backend suffixes stripped for capability
+    checks. Not cached on its own: it's cheap to recompute, and a second
+    lru_cache here would need its own cache_clear() everywhere the existing
+    one already gets cleared (tests included) or it goes stale."""
     return frozenset(_normalize_gsr_codec_name(c) for c in _gsr_supported_codecs())
 
 
