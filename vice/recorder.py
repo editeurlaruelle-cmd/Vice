@@ -1703,7 +1703,7 @@ def _next_templated_path(
         # Build a matcher from the template so numbering survives a change to
         # anything around $n. The marker is a private-use codepoint: it lives
         # through sanitizing and cannot occur in a real filename.
-        placeholder = ""
+        placeholder = "\ue000"
         literal = _render_clip_name(template.replace("$n", placeholder), 0, tag, now)
         if placeholder not in literal:
             return None
